@@ -30,15 +30,15 @@ const dataAtual = (date = new Date()) =>
   `${DIAS[date.getDay()]}, ${date.getDate()} de ${MESES[date.getMonth()]}`;
 
 function formatarDuracao(minutosTotais) {
-  if (minutosTotais === null || minutosTotais === undefined || isNaN(minutosTotais)) return '—';
+  if (minutosTotais === null || minutosTotais === undefined || isNaN(minutosTotais)) return 'Sem dados nas últimas 2hrs';
   const h = Math.floor(minutosTotais / 60);
   const m = Math.round(minutosTotais % 60);
   return h === 0 ? `${m} min` : `${h}h ${pad(m)} min`;
 }
 
 function corPelaEspera(minutos) {
-  if (minutos === null || minutos === undefined) return '';
-  if (minutos < 60) return '';
+  if (minutos === null) return 'wait-gray';
+  if (minutos < 60) return 'wait-green';
   if (minutos < 90) return 'wait-yellow';
   return 'wait-red';
 }
@@ -50,6 +50,97 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat / 2) ** 2 +
             Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/* ============================================================
+   CÁLCULO DO TEMPO MÉDIO DE ESPERA
+   ------------------------------------------------------------
+   Em vez de "resetar" a média em horários fixos (o que gera
+   buracos/dados vazios), usamos:
+
+   1) Janela deslizante curta (2h) — se tiver poucas amostras,
+      cai pra uma janela de 6h só pra não mostrar "sem dados".
+   2) Peso por recência (decaimento exponencial, meia-vida de
+      30min) — um atendimento finalizado há 5min pesa muito
+      mais que um finalizado há 1h50.
+   3) Sinal ao vivo — usa quem está com status 'em_andamento'
+      agora (chegou, ainda não fez check-out) pra captar
+      mudanças de fluxo que ainda não geraram nenhum check-out.
+   ============================================================ */
+const JANELA_CURTA_MS = 2 * 60 * 60 * 1000;  // 2h
+const JANELA_LONGA_MS = 6 * 60 * 60 * 1000;  // 6h (fallback se tiver poucos dados)
+const MEIA_VIDA_MIN = 30;                     // peso cai pela metade a cada 30min
+const MIN_AMOSTRAS = 3;                       // abaixo disso, tenta a janela maior
+
+function pesoPorRecencia(minutosAtras) {
+  return Math.pow(0.5, minutosAtras / MEIA_VIDA_MIN);
+}
+
+function mediaPonderadaFinalizados(lista, agora, janelaMs) {
+  const limite = agora.getTime() - janelaMs;
+  const validos = lista.filter(a =>
+    a.tempo_permanencia_minutos !== null &&
+    new Date(a.horario_saida).getTime() >= limite
+  );
+  if (validos.length === 0) return null;
+
+  let somaPesos = 0;
+  let somaPonderada = 0;
+  validos.forEach(a => {
+    const minutosAtras = (agora.getTime() - new Date(a.horario_saida).getTime()) / 60000;
+    const peso = pesoPorRecencia(minutosAtras);
+    somaPesos += peso;
+    somaPonderada += peso * a.tempo_permanencia_minutos;
+  });
+
+  return { media: somaPonderada / somaPesos, amostras: validos.length, pesoTotal: somaPesos };
+}
+
+function calcularTempoMedioUpa(finalizadosDaUpa, emAndamentoDaUpa, agora) {
+  let resultado = mediaPonderadaFinalizados(finalizadosDaUpa, agora, JANELA_CURTA_MS);
+  let janela = '2h';
+
+  if (!resultado || resultado.amostras < MIN_AMOSTRAS) {
+    const resultadoLongo = mediaPonderadaFinalizados(finalizadosDaUpa, agora, JANELA_LONGA_MS);
+    if (resultadoLongo) { resultado = resultadoLongo; janela = '6h'; }
+  }
+
+  const esperasAoVivo = emAndamentoDaUpa.map(a =>
+    (agora.getTime() - new Date(a.horario_chegada).getTime()) / 60000
+  );
+  const mediaAoVivo = esperasAoVivo.length
+    ? esperasAoVivo.reduce((a, b) => a + b, 0) / esperasAoVivo.length
+    : null;
+  const maiorEsperaAoVivo = esperasAoVivo.length ? Math.max(...esperasAoVivo) : null;
+
+  if (!resultado && mediaAoVivo === null) {
+    return { tempoMedio: null, confiabilidade: 'sem_dados' };
+  }
+  if (!resultado) {
+    return { tempoMedio: mediaAoVivo, confiabilidade: 'baixa' };
+  }
+
+  let tempoFinal = resultado.media;
+  let confiabilidade = resultado.amostras >= MIN_AMOSTRAS ? 'alta' : 'media';
+
+  if (mediaAoVivo !== null) {
+    // Combina o histórico recente com quem está esperando agora.
+    // O sinal "ao vivo" recebe peso extra por pessoa, pois é o
+    // dado mais atual que existe (ainda nem terminou, mas já
+    // mostra pra onde a fila está indo).
+    const pesoFinalizados = resultado.pesoTotal;
+    const pesoAoVivo = esperasAoVivo.length * 1.5;
+    tempoFinal = (resultado.media * pesoFinalizados + mediaAoVivo * pesoAoVivo) / (pesoFinalizados + pesoAoVivo);
+
+    // Se alguém já está esperando mais tempo do que a estimativa
+    // combinada, isso é sinal de piora recente — usamos como piso
+    // (sem pular direto pro máximo, só suaviza pra cima).
+    if (maiorEsperaAoVivo !== null && maiorEsperaAoVivo > tempoFinal) {
+      tempoFinal = (tempoFinal + maiorEsperaAoVivo) / 2;
+    }
+  }
+
+  return { tempoMedio: tempoFinal, amostras: resultado.amostras, janela, confiabilidade };
 }
 
 function getOrCreateDeviceId() {
@@ -75,9 +166,36 @@ function atualizarRelogios() {
   const agora = new Date();
   document.querySelectorAll('[data-clock-time]').forEach(el => el.textContent = horaAtual(agora));
   document.querySelectorAll('[data-clock-date]').forEach(el => el.textContent = dataAtual(agora));
+  atualizarBannerAtivo(agora);
 }
 atualizarRelogios();
 setInterval(atualizarRelogios, 1000);
+
+/* ============================================================
+   BANNER "ATENDIMENTO EM ANDAMENTO" (tela Início)
+   ============================================================ */
+function atualizarBannerAtivo(agora = new Date()) {
+  const banner = document.getElementById('active-banner');
+  const ativoStr = localStorage.getItem('monitora_upa_atendimento_ativo');
+
+  if (!ativoStr) {
+    banner.style.display = 'none';
+    return;
+  }
+
+  const ativo = JSON.parse(ativoStr);
+  const minutos = Math.max(0, Math.round((agora - new Date(ativo.horarioChegada)) / 60000));
+  const cor = corPelaEspera(minutos);
+
+  banner.className = `active-banner ${cor === 'wait-gray' ? 'wait-green' : cor}`;
+  banner.style.display = 'flex';
+  document.getElementById('active-banner-text').textContent =
+    `Atendimento em andamento: ${minutos} min`;
+}
+
+document.getElementById('active-banner').addEventListener('click', () => {
+  carregarCheckout();
+});
 
 /* ============================================================
    NAVEGAÇÃO ENTRE TELAS
@@ -107,7 +225,7 @@ async function obterLocalizacao() {
     navigator.geolocation.getCurrentPosition(
       pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
       () => resolve(null),
-      { timeout: 6000 }
+      { timeout: 10000, enableHighAccuracy: true, maximumAge: 0 }
     );
   });
 }
@@ -129,26 +247,44 @@ async function carregarUpas() {
     return;
   }
 
-  const desde = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
-  const { data: atendimentos } = await sb
-    .from('atendimentos')
-    .select('upa_id, tempo_permanencia_minutos')
-    .eq('status', 'finalizado')
-    .gte('criado_em', desde);
+  const agora = new Date();
+  const desde = new Date(agora.getTime() - JANELA_LONGA_MS).toISOString();
 
-  const temposPorUpa = {};
-  (atendimentos || []).forEach(a => {
-    if (a.tempo_permanencia_minutos === null) return;
-    (temposPorUpa[a.upa_id] ??= []).push(a.tempo_permanencia_minutos);
-  });
+  // Busca os finalizados dentro da janela mais longa (6h) — a função
+  // de cálculo decide sozinha se usa só os últimos 2h ou recorre aos 6h.
+  const { data: finalizados } = await sb
+    .from('atendimentos')
+    .select('upa_id, tempo_permanencia_minutos, horario_saida')
+    .eq('status', 'finalizado')
+    .gte('horario_saida', desde);
+
+  // Busca quem está esperando agora (sinal ao vivo).
+  const { data: emAndamento } = await sb
+    .from('atendimentos')
+    .select('upa_id, horario_chegada')
+    .eq('status', 'em_andamento');
+
+  const finalizadosPorUpa = {};
+  (finalizados || []).forEach(a => { (finalizadosPorUpa[a.upa_id] ??= []).push(a); });
+
+  const emAndamentoPorUpa = {};
+  (emAndamento || []).forEach(a => { (emAndamentoPorUpa[a.upa_id] ??= []).push(a); });
 
   const upasComDados = (upas || []).map(u => {
-    const tempos = temposPorUpa[u.id] || [];
-    const tempoMedio = tempos.length ? tempos.reduce((a, b) => a + b, 0) / tempos.length : null;
+    const resultado = calcularTempoMedioUpa(
+      finalizadosPorUpa[u.id] || [],
+      emAndamentoPorUpa[u.id] || [],
+      agora
+    );
     const distanciaKm = state.posicaoUsuario
       ? haversineKm(state.posicaoUsuario.lat, state.posicaoUsuario.lng, u.latitude, u.longitude)
       : null;
-    return { ...u, tempoMedio, distanciaKm };
+    return {
+      ...u,
+      tempoMedio: resultado.tempoMedio,
+      confiabilidade: resultado.confiabilidade,
+      distanciaKm
+    };
   });
 
   state.upasCache = upasComDados;
@@ -177,17 +313,35 @@ function renderizarLista(upas) {
 
   ordenadas.forEach(u => {
     const corClasse = corPelaEspera(u.tempoMedio);
+    const avisoConfianca = (u.confiabilidade === 'media' || u.confiabilidade === 'baixa')
+      ? '<div class="upa-confidence">baseado em poucos dados</div>'
+      : '';
     const card = document.createElement('div');
     card.className = `upa-card ${corClasse}`;
     card.innerHTML = `
       <div>
         <div class="upa-name">${u.nome}</div>
         <div class="upa-distance">${u.distanciaKm !== null ? u.distanciaKm.toFixed(1).replace('.', ',') + ' km' : 'distância indisponível'}</div>
+        ${avisoConfianca}
       </div>
       <div class="upa-wait ${corClasse}">${formatarDuracao(u.tempoMedio)}</div>
     `;
     card.addEventListener('click', () => iniciarCheckin(u));
     lista.appendChild(card);
+  });
+}
+
+function preencherSelectsDeUpas() {
+  const opts = [...state.upasCache]
+    .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'))
+    .map(u => `<option value="${u.id}">${u.nome}</option>`)
+    .join('');
+  ['checkin-upa-select', 'retro-upa-select'].forEach(id => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const valorAtual = sel.value;
+    sel.innerHTML = '<option value="" selected disabled>selecione</option>' + opts;
+    if (valorAtual) sel.value = valorAtual;
   });
 }
 
@@ -206,17 +360,34 @@ document.querySelectorAll('.pill-toggle').forEach(btn => {
 let respostaSelecionada = null;
 
 function iniciarCheckin(upa) {
-  state.upaSelecionada = upa;
-  respostaSelecionada = null;
+  respostaSelecionada = upa ? 'sim' : null;
+  state.upaSelecionada = upa || null;
 
-  document.getElementById('checkin-upa-nome').textContent = upa.nome;
   const campoHora = document.getElementById('checkin-time');
   campoHora.textContent = horaAtual();
   campoHora.contentEditable = 'false';
 
   document.querySelectorAll('#screen-checkin [data-response]').forEach(b => b.classList.remove('selected'));
+
+  const select = document.getElementById('checkin-upa-select');
+  if (upa) {
+    select.value = upa.id;
+    document.querySelector('#screen-checkin [data-response="sim"]').classList.add('selected');
+  } else {
+    select.value = '';
+  }
+
   mostrarTela('screen-checkin');
 }
+
+document.getElementById('checkin-upa-select').addEventListener('change', (e) => {
+  const upa = state.upasCache.find(u => u.id === e.target.value);
+  if (!upa) return;
+  state.upaSelecionada = upa;
+  respostaSelecionada = 'sim';
+  document.querySelectorAll('#screen-checkin [data-response]').forEach(b => b.classList.remove('selected'));
+  document.querySelector('#screen-checkin [data-response="sim"]').classList.add('selected');
+});
 
 document.querySelectorAll('#screen-checkin [data-response]').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -247,7 +418,7 @@ document.getElementById('btn-confirmar-chegada').addEventListener('click', async
     return;
   }
   if (!state.upaSelecionada) {
-    alert('Selecione uma UPA na tela inicial primeiro.');
+    alert('Selecione a UPA no menu acima.');
     return;
   }
   if (!sb) {
@@ -285,27 +456,110 @@ document.getElementById('btn-confirmar-chegada').addEventListener('click', async
    TELA DE CHECK-OUT (saída)
    ============================================================ */
 function carregarCheckout() {
+  const cardNormal = document.getElementById('checkout-card-normal');
+  const cardRetro = document.getElementById('checkout-card-retroativo');
   const ativoStr = localStorage.getItem('monitora_upa_atendimento_ativo');
-  if (!ativoStr) {
-    alert('Nenhum atendimento em andamento. Faça o check-in primeiro.');
-    mostrarTela('screen-home');
-    return;
+
+  if (ativoStr) {
+    cardNormal.style.display = '';
+    cardRetro.style.display = 'none';
+
+    const ativo = JSON.parse(ativoStr);
+    const chegada = new Date(ativo.horarioChegada);
+    const agora = new Date();
+    const minutos = Math.max(0, Math.round((agora - chegada) / 60000));
+
+    document.getElementById('checkout-upa-nome').textContent = ativo.upaNome;
+    document.getElementById('permanencia-valor').textContent = formatarDuracao(minutos);
+
+    const campoHora = document.getElementById('checkout-time');
+    campoHora.textContent = horaAtual(agora);
+    campoHora.contentEditable = 'false';
+  } else {
+    cardNormal.style.display = 'none';
+    cardRetro.style.display = '';
+    prepararCheckoutRetroativo();
   }
-
-  const ativo = JSON.parse(ativoStr);
-  const chegada = new Date(ativo.horarioChegada);
-  const agora = new Date();
-  const minutos = Math.max(0, Math.round((agora - chegada) / 60000));
-
-  document.getElementById('checkout-upa-nome').textContent = ativo.upaNome;
-  document.getElementById('permanencia-valor').textContent = formatarDuracao(minutos);
-
-  const campoHora = document.getElementById('checkout-time');
-  campoHora.textContent = horaAtual(agora);
-  campoHora.contentEditable = 'false';
 
   mostrarTela('screen-checkout');
 }
+
+/* ------------------------------------------------------------
+   Variante retroativa — pessoa não fez check-in neste aparelho,
+   mas quer registrar um atendimento das últimas 2 horas.
+   ------------------------------------------------------------ */
+function prepararCheckoutRetroativo() {
+  const agora = new Date();
+  const chegadaPadrao = new Date(agora.getTime() - 30 * 60000); // sugestão: chegou há 30min
+
+  document.getElementById('retro-upa-select').value = '';
+  document.getElementById('retro-chegada-time').textContent = horaAtual(chegadaPadrao);
+  document.getElementById('retro-saida-time').textContent = horaAtual(agora);
+  atualizarPermanenciaRetro();
+}
+
+function atualizarPermanenciaRetro() {
+  const chegada = parseHoraParaData(document.getElementById('retro-chegada-time').textContent);
+  const saida = parseHoraParaData(document.getElementById('retro-saida-time').textContent);
+  let minutos = Math.round((saida - chegada) / 60000);
+  if (isNaN(minutos) || minutos < 0) minutos = null;
+  document.getElementById('retro-permanencia-valor').textContent =
+    minutos === null ? '--' : formatarDuracao(minutos);
+}
+
+['retro-chegada-time', 'retro-saida-time'].forEach(id => {
+  const campo = document.getElementById(id);
+  campo.addEventListener('input', atualizarPermanenciaRetro);
+  campo.addEventListener('blur', atualizarPermanenciaRetro);
+});
+
+document.getElementById('btn-retro-confirmar').addEventListener('click', async () => {
+  const upaId = document.getElementById('retro-upa-select').value;
+  if (!upaId) {
+    alert('Selecione a unidade onde você foi atendido.');
+    return;
+  }
+  if (!sb) {
+    alert('Configure o Supabase em app.js para salvar o atendimento.');
+    return;
+  }
+
+  const chegada = parseHoraParaData(document.getElementById('retro-chegada-time').textContent);
+  const saida = parseHoraParaData(document.getElementById('retro-saida-time').textContent);
+  const minutos = Math.round((saida - chegada) / 60000);
+
+  if (isNaN(minutos) || minutos < 0) {
+    alert('Verifique os horários: a saída precisa ser depois da chegada.');
+    return;
+  }
+  if (minutos > 120) {
+    const continuar = confirm('Esse período passa de 2 horas. Registrar mesmo assim?');
+    if (!continuar) return;
+  }
+
+  const { error } = await sb.from('atendimentos').insert({
+    upa_id: upaId,
+    dispositivo_id: state.deviceId,
+    horario_chegada: chegada.toISOString(),
+    horario_saida: saida.toISOString(),
+    tempo_permanencia_minutos: minutos,
+    status: 'finalizado'
+  });
+
+  if (error) {
+    alert('Não foi possível registrar o atendimento.');
+    console.error(error);
+    return;
+  }
+
+  alert('Atendimento registrado. Obrigado por ajudar!');
+  mostrarTela('screen-home');
+  carregarUpas();
+});
+
+document.getElementById('btn-retro-cancelar').addEventListener('click', () => {
+  mostrarTela('screen-home');
+});
 
 document.getElementById('btn-corrigir-saida').addEventListener('click', () => {
   const campo = document.getElementById('checkout-time');
@@ -370,7 +624,11 @@ document.querySelectorAll('.proto-nav [data-goto]').forEach(btn => {
    INICIALIZAÇÃO
    ============================================================ */
 (async function init() {
-  mostrarTela('screen-home');
+  const ativoStr = localStorage.getItem('monitora_upa_atendimento_ativo');
+  if (ativoStr) { mostrarTela('screen-home'); } else { iniciarCheckin(null); }
+
   state.posicaoUsuario = await obterLocalizacao();
   await carregarUpas();
+  preencherSelectsDeUpas();
+  atualizarBannerAtivo();
 })();
