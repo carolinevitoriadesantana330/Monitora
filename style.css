@@ -4,6 +4,7 @@
   --blue-light:#2f7bc4;
   --green:#1fa34d;
   --red:#d92c2c;
+  --cinza-claro: #D3D3D3;
   --blue-accent:#2f6fd1;
   --yellow:#e0a316;
   --gray-bg:#eef0f3;
@@ -40,6 +41,37 @@ body{
 .status-clock{ text-align:center; margin-bottom:14px; }
 .clock-time{ font-size:3.1rem; font-weight:700; letter-spacing:1px; }
 .clock-date{ font-size:1.05rem; font-weight:600; margin-top:2px; }
+
+/* ===================== AVISO DE LOCALIZAÇÃO ===================== */
+.location-hint{
+  font-size:0.76rem;
+  color:rgba(255,255,255,.72);
+  text-align:center;
+  max-width:320px;
+  margin:0 auto 4px;
+  line-height:1.3;
+}
+
+/* ===================== SELECT DE UPA ===================== */
+.upa-select{
+  width:100%;
+  background:#e2e5ea;
+  border:none;
+  border-radius:12px;
+  padding:13px 14px;
+  font-weight:600;
+  font-size:0.92rem;
+  font-family:inherit;
+  color:#222;
+  margin-bottom:14px;
+}
+.upa-select:invalid{ color:#6b7280; }
+.field-label{
+  font-weight:700;
+  font-size:0.88rem;
+  color:#111;
+  margin-bottom:6px;
+}
 
 /* ===================== CARTÃO DE NOTIFICAÇÃO ===================== */
 .notif-card{
@@ -123,6 +155,27 @@ body{
 .btn--solid-gray{ background:#8b93a1; }
 .btn--solid-red{ background:var(--red); }
 
+/* ===================== BANNER DE ATENDIMENTO EM ANDAMENTO ===================== */
+.active-banner{
+  display:none;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  background:rgba(255,255,255,.15);
+  border:1px solid rgba(255,255,255,.5);
+  border-radius:14px;
+  padding:11px 16px;
+  margin-bottom:18px;
+  font-weight:700;
+  font-size:0.85rem;
+  color:#fff;
+  cursor:pointer;
+}
+.active-banner.wait-green{ background:rgba(31,163,77,.32); border-color:var(--green); }
+.active-banner.wait-yellow{ background:rgba(224,163,22,.32); border-color:var(--yellow); }
+.active-banner.wait-red{ background:rgba(217,44,44,.32); border-color:var(--red); }
+.active-banner-cta{ text-decoration:underline; white-space:nowrap; flex-shrink:0; }
+
 /* ===================== TELA INICIAL (LISTA) ===================== */
 .home-header{
   background:radial-gradient(circle at 25% 12%, var(--blue-light), var(--blue-mid) 55%, var(--blue-dark) 100%);
@@ -158,21 +211,25 @@ body{
 
 .upa-card{
   background:#fff;
-  border-left:6px solid var(--green);
+  border-left:6px solid var(--cinza-claro);
   border-radius:16px;
   padding:16px 18px;
   display:flex; justify-content:space-between; align-items:center; gap:12px;
   box-shadow:0 2px 10px rgba(0,0,0,.06);
   cursor:pointer;
 }
+.upa-card.wait-green{ border-color:var(--green); }
 .upa-card.wait-yellow{ border-color:var(--yellow); }
 .upa-card.wait-red{ border-color:var(--red); }
+.upa-wait.wait-gray{ border-color:var(--gray-text); }
 
 .upa-name{ font-weight:700; font-size:1rem; color:#111; }
-.upa-distance{ color:var(--gray-text); font-size:0.85rem; margin-top:3px; }
-.upa-wait{ font-weight:700; font-size:1rem; color:var(--green); white-space:nowrap; }
-.upa-wait.wait-yellow{ color:var(--yellow); }
-.upa-wait.wait-red{ color:var(--red); }
+.upa-distance{ color:var(--gray-text); font: size 0.72rem; margin-top:3px; }
+.upa-confidence{ color:var(--gray-text); font-size:0.72rem; font-style:italic; margin-top:2px; }
+.upa-card.wait-green{ font-weight:700; font-size:1rem; color:var(--green); white-space:nowrap; }
+.upa-wait.wait-gray{ color:var(--gray-text); font-size:0.72rem; font-style:italic; margin-top:2px; }
+.upa-wait.wait-yellow{ font-weight:700; font-size:1rem; color:var(--yellow); white-space:nowrap; }
+.upa-wait.wait-red{ font-weight:700; font-size:1rem; color:var(--red); white-space:nowrap; }
 
 /* ===================== BARRA DE PROTÓTIPO ===================== */
 .proto-nav{
