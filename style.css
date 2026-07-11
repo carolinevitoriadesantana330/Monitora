@@ -224,9 +224,9 @@ body{
 .upa-wait.wait-gray{ border-color:var(--gray-text); }
 
 .upa-name{ font-weight:700; font-size:1rem; color:#111; }
-.upa-distance{ color:var(--gray-text); font: size 0.72rem; margin-top:3px; }
+.upa-distance{ color:var(--gray-text); font-size:0.72rem; margin-top:3px; }
 .upa-confidence{ color:var(--gray-text); font-size:0.72rem; font-style:italic; margin-top:2px; }
-.upa-card.wait-green{ font-weight:700; font-size:1rem; color:var(--green); white-space:nowrap; }
+.upa-wait.wait-green{ font-weight:700; font-size:1rem; color:var(--green); white-space:nowrap; }
 .upa-wait.wait-gray{ color:var(--gray-text); font-size:0.72rem; font-style:italic; margin-top:2px; }
 .upa-wait.wait-yellow{ font-weight:700; font-size:1rem; color:var(--yellow); white-space:nowrap; }
 .upa-wait.wait-red{ font-weight:700; font-size:1rem; color:var(--red); white-space:nowrap; }
