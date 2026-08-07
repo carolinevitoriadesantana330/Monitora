@@ -6,10 +6,28 @@
 const SUPABASE_URL = 'https://zxepgwlrhcqddgiopnsh.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_krLbkRQAASCCZrIGyUTpeA_GNgtluwc';
 
+/* ------------------------------------------------------------
+   ID do dispositivo — precisa existir ANTES de criar o client,
+   pois é enviado em todo request via header (usado pelas
+   policies de RLS para saber quem pode dar checkout).
+   ------------------------------------------------------------ */
+function getOrCreateDeviceId() {
+  let id = localStorage.getItem('monitora_upa_device_id');
+  if (!id) {
+    id = crypto.randomUUID ? crypto.randomUUID() : 'dev-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    localStorage.setItem('monitora_upa_device_id', id);
+  }
+  return id;
+}
+
+const DEVICE_ID = getOrCreateDeviceId();
+
 let sb = null;
 try {
   if (window.supabase && SUPABASE_URL.indexOf('SEU-PROJETO') === -1) {
-    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      global: { headers: { 'x-device-id': DEVICE_ID } }
+    });
   }
 } catch (e) {
   console.warn('Supabase ainda não configurado:', e);
@@ -216,15 +234,6 @@ function preverPorRegressao(modelo, horaAtualNum) {
   return Math.max(0, previsto); // tempo de espera não pode ser negativo
 }
 
-function getOrCreateDeviceId() {
-  let id = localStorage.getItem('monitora_upa_device_id');
-  if (!id) {
-    id = crypto.randomUUID ? crypto.randomUUID() : 'dev-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-    localStorage.setItem('monitora_upa_device_id', id);
-  }
-  return id;
-}
-
 function parseHoraParaData(textoHHMM, base = new Date()) {
   const [hh, mm] = textoHHMM.split(':').map(Number);
   const d = new Date(base);
@@ -282,7 +291,7 @@ function mostrarTela(id) {
    ESTADO GLOBAL
    ============================================================ */
 const state = {
-  deviceId: getOrCreateDeviceId(),
+  deviceId: DEVICE_ID,
   upaSelecionada: null,
   upasCache: [],
   ordenarPor: 'tempo',
