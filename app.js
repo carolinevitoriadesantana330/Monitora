@@ -143,6 +143,79 @@ function calcularTempoMedioUpa(finalizadosDaUpa, emAndamentoDaUpa, agora) {
   return { tempoMedio: tempoFinal, amostras: resultado.amostras, janela, confiabilidade };
 }
 
+/* ============================================================
+   COMPONENTE DE APRENDIZADO DE MÁQUINA
+   ------------------------------------------------------------
+   Regressão linear simples (mínimos quadrados ordinários),
+   treinada a cada carregamento a partir do histórico real de
+   atendimentos de cada UPA:
+
+     tempo_permanencia_min  ~  a + b * hora_do_dia
+
+   Este é o modelo supervisionado descrito no trabalho científico
+   (linha "IA & Tecnologia — Aprendizado de Máquina aplicado à
+   tomada de decisão"): aprende os coeficientes a e b a partir
+   dos dados observados, em vez de usar apenas constantes fixas.
+
+   Não substitui a heurística de recência/sinal ao vivo acima —
+   ela continua sendo o sinal mais confiável no curtíssimo prazo.
+   O modelo entra como reforço quando há POUCOS dados recentes
+   (poucas amostras nas últimas 2h/6h), usando o padrão histórico
+   por horário do dia para não cair em "sem dados".
+   ============================================================ */
+const MIN_PONTOS_REGRESSAO = 5; // abaixo disso, o modelo não é confiável o suficiente pra usar
+
+function regressaoLinearSimples(pontosXY) {
+  const n = pontosXY.length;
+  if (n < MIN_PONTOS_REGRESSAO) return null;
+
+  let somaX = 0, somaY = 0, somaXY = 0, somaXX = 0;
+  pontosXY.forEach(([x, y]) => {
+    somaX += x; somaY += y; somaXY += x * y; somaXX += x * x;
+  });
+
+  const denominador = n * somaXX - somaX * somaX;
+  if (denominador === 0) return null; // todos os pontos no mesmo horário — não dá pra ajustar reta
+
+  const b = (n * somaXY - somaX * somaY) / denominador;
+  const a = (somaY - b * somaX) / n;
+
+  // R² — o quanto o horário do dia explica a variação do tempo de espera.
+  // Reportar isso na banca é mais honesto do que só apresentar a previsão.
+  const media = somaY / n;
+  let ssTot = 0, ssRes = 0;
+  pontosXY.forEach(([x, y]) => {
+    const previsto = a + b * x;
+    ssTot += (y - media) ** 2;
+    ssRes += (y - previsto) ** 2;
+  });
+  const r2 = ssTot === 0 ? 0 : 1 - ssRes / ssTot;
+
+  return { a, b, n, r2 };
+}
+
+/**
+ * Treina um modelo por UPA usando TODO o histórico de atendimentos
+ * finalizados (não só a janela curta), pois a regressão precisa de
+ * volume de dados para captar o padrão por horário do dia.
+ */
+function treinarModelosPorHorario(finalizadosPorUpa) {
+  const modelos = {};
+  Object.keys(finalizadosPorUpa).forEach(upaId => {
+    const pontos = finalizadosPorUpa[upaId]
+      .filter(a => a.tempo_permanencia_minutos !== null && a.horario_saida)
+      .map(a => [new Date(a.horario_saida).getHours(), a.tempo_permanencia_minutos]);
+    modelos[upaId] = regressaoLinearSimples(pontos);
+  });
+  return modelos;
+}
+
+function preverPorRegressao(modelo, horaAtualNum) {
+  if (!modelo) return null;
+  const previsto = modelo.a + modelo.b * horaAtualNum;
+  return Math.max(0, previsto); // tempo de espera não pode ser negativo
+}
+
 function getOrCreateDeviceId() {
   let id = localStorage.getItem('monitora_upa_device_id');
   if (!id) {
@@ -264,11 +337,26 @@ async function carregarUpas() {
     .select('upa_id, horario_chegada')
     .eq('status', 'em_andamento');
 
+  // Busca um histórico mais longo (30 dias) exclusivamente para TREINAR
+  // o modelo de regressão por horário do dia — precisa de mais volume
+  // e de mais variação de horário do que a janela curta usada acima.
+  const desdeRegressao = new Date(agora.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const { data: finalizadosHistorico } = await sb
+    .from('atendimentos')
+    .select('upa_id, tempo_permanencia_minutos, horario_saida')
+    .eq('status', 'finalizado')
+    .gte('horario_saida', desdeRegressao);
+
   const finalizadosPorUpa = {};
   (finalizados || []).forEach(a => { (finalizadosPorUpa[a.upa_id] ??= []).push(a); });
 
   const emAndamentoPorUpa = {};
   (emAndamento || []).forEach(a => { (emAndamentoPorUpa[a.upa_id] ??= []).push(a); });
+
+  const finalizadosHistPorUpa = {};
+  (finalizadosHistorico || []).forEach(a => { (finalizadosHistPorUpa[a.upa_id] ??= []).push(a); });
+
+  const modelosRegressao = treinarModelosPorHorario(finalizadosHistPorUpa);
 
   const upasComDados = (upas || []).map(u => {
     const resultado = calcularTempoMedioUpa(
@@ -276,13 +364,33 @@ async function carregarUpas() {
       emAndamentoPorUpa[u.id] || [],
       agora
     );
+
+    let tempoMedio = resultado.tempoMedio;
+    let confiabilidade = resultado.confiabilidade;
+    let origemEstimativa = 'heuristica';
+
+    // Componente de aprendizado de máquina: só entra em ação quando a
+    // heurística de curto prazo tem pouco ou nenhum dado — é o reforço
+    // baseado no padrão histórico aprendido por horário do dia.
+    const modelo = modelosRegressao[u.id];
+    if (modelo && (tempoMedio === null || confiabilidade === 'baixa' || confiabilidade === 'sem_dados')) {
+      const previsao = preverPorRegressao(modelo, agora.getHours());
+      if (previsao !== null) {
+        tempoMedio = tempoMedio === null ? previsao : (tempoMedio + previsao) / 2;
+        confiabilidade = 'media';
+        origemEstimativa = 'regressao';
+      }
+    }
+
     const distanciaKm = state.posicaoUsuario
       ? haversineKm(state.posicaoUsuario.lat, state.posicaoUsuario.lng, u.latitude, u.longitude)
       : null;
     return {
       ...u,
-      tempoMedio: resultado.tempoMedio,
-      confiabilidade: resultado.confiabilidade,
+      tempoMedio,
+      confiabilidade,
+      origemEstimativa,
+      modeloR2: modelo ? modelo.r2 : null,
       distanciaKm
     };
   });
@@ -313,9 +421,12 @@ function renderizarLista(upas) {
 
   ordenadas.forEach(u => {
     const corClasse = corPelaEspera(u.tempoMedio);
-    const avisoConfianca = (u.confiabilidade === 'media' || u.confiabilidade === 'baixa')
-      ? '<div class="upa-confidence">baseado em poucos dados</div>'
-      : '';
+    let avisoConfianca = '';
+    if (u.origemEstimativa === 'regressao') {
+      avisoConfianca = '<div class="upa-confidence">estimativa por padrão histórico do horário</div>';
+    } else if (u.confiabilidade === 'media' || u.confiabilidade === 'baixa') {
+      avisoConfianca = '<div class="upa-confidence">baseado em poucos dados</div>';
+    }
     const card = document.createElement('div');
     card.className = `upa-card ${corClasse}`;
     card.innerHTML = `
@@ -621,6 +732,32 @@ document.querySelectorAll('.proto-nav [data-goto]').forEach(btn => {
 });
 
 /* ============================================================
+   SUGESTÃO AUTOMÁTICA DE UPA POR PROXIMIDADE (check-in)
+   ------------------------------------------------------------
+   Isto NÃO é geofencing real (o navegador não avisa sozinho
+   quando você chega) — é uma sugestão pré-selecionada com base
+   na localização já obtida, que a pessoa ainda confirma ou troca.
+   É importante descrever assim no trabalho científico: "sugestão
+   automática por proximidade, com confirmação do usuário", e não
+   "identificação automática de chegada" — isso ainda exigiria
+   geofencing em segundo plano, que um site comum não faz.
+   ============================================================ */
+function sugerirUpaMaisProxima() {
+  if (state.upaSelecionada) return; // já existe uma seleção manual, não sobrescreve
+  const telaCheckin = document.getElementById('screen-checkin');
+  if (!telaCheckin.classList.contains('active')) return;
+  if (!state.posicaoUsuario) return;
+
+  const comDistancia = state.upasCache.filter(u => u.distanciaKm !== null);
+  if (comDistancia.length === 0) return;
+
+  const maisProxima = comDistancia.reduce((a, b) => (a.distanciaKm < b.distanciaKm ? a : b));
+  if (maisProxima.distanciaKm > 1.5) return; // longe demais pra sugerir com segurança
+
+  iniciarCheckin(maisProxima);
+}
+
+/* ============================================================
    INICIALIZAÇÃO
    ============================================================ */
 (async function init() {
@@ -630,5 +767,6 @@ document.querySelectorAll('.proto-nav [data-goto]').forEach(btn => {
   state.posicaoUsuario = await obterLocalizacao();
   await carregarUpas();
   preencherSelectsDeUpas();
+  sugerirUpaMaisProxima();
   atualizarBannerAtivo();
 })();
